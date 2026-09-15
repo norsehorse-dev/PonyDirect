@@ -35,13 +35,16 @@ public final class PonyDirectUDPSocket {
     /// Bind an IPv4 UDP socket to an ephemeral port with address/port reuse so the
     /// STUN-reflexive mapping and the punch traffic share one port. Throws on failure.
     public init() throws {
-        fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-        guard fd >= 0 else { throw PonyDirectSocketError.create(errno) }
+        // Use a local handle throughout init: referencing the `fd` member inside the
+        // pointer closures below would capture self before `localPort` is set.
+        let handle = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard handle >= 0 else { throw PonyDirectSocketError.create(errno) }
+        fd = handle
 
         var yes: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
         #if canImport(Darwin)
-        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(handle, SOL_SOCKET, SO_REUSEPORT, &yes, socklen_t(MemoryLayout<Int32>.size))
         #endif
 
         var addr = sockaddr_in()
@@ -50,14 +53,14 @@ public final class PonyDirectUDPSocket {
         addr.sin_port = 0                    // ephemeral
         let bindOK = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                bind(handle, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
         guard bindOK == 0 else {
             #if canImport(Darwin)
-            Darwin.close(fd)
+            Darwin.close(handle)
             #else
-            Glibc.close(fd)
+            Glibc.close(handle)
             #endif
             throw PonyDirectSocketError.bind(errno)
         }
@@ -67,7 +70,7 @@ public final class PonyDirectUDPSocket {
         var len = socklen_t(MemoryLayout<sockaddr_in>.size)
         _ = withUnsafeMutablePointer(to: &bound) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                getsockname(fd, $0, &len)
+                getsockname(handle, $0, &len)
             }
         }
         localPort = UInt16(bigEndian: bound.sin_port)
