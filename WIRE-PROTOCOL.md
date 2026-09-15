@@ -44,17 +44,50 @@ On connect:
 
 Signaling (offer/answer/ice, carrying an `ip:port` candidate list and a 16-byte
 `session_nonce`) travels over the application's own confidential channel, not over
-this protocol. Once candidates are exchanged, both sides send authenticated probes
-to each other's candidates and listen:
+this protocol.
 
-    probe = probe_nonce(16) || HMAC(K, "ponydirect/wan-probe/v1" || session_nonce || probe_nonce)
-    pong  =                     HMAC(K, "ponydirect/wan-pong/v1"  || session_nonce || probe_nonce)
+### Candidate gathering (STUN, RFC 5389)
 
-The first candidate pair that yields a valid pong is the active path. Only the real
-peer can produce a valid probe or pong, so an off-path or spoofed sender cannot
-hijack the path; `session_nonce` binds the exchange so a captured probe cannot be
-replayed into a new session. Symmetric NAT on both ends will not punch; the host
-app falls back to its own store-and-forward path (no TURN).
+Each device binds one UDP socket and gathers two kinds of candidate on that socket's
+local port:
+
+- Host candidates: every non-loopback local IPv4 `ip:port`.
+- Server-reflexive candidate: the public `ip:port` the socket maps to, learned with
+  one STUN Binding request to the app's self-hosted STUN server.
+
+Binding request (20 bytes, no attributes):
+
+    type(2)=0x0001 | length(2)=0x0000 | magic(4)=0x2112A442 | transaction_id(12, random)
+
+Binding success response `type=0x0101`; the client matches `magic` and
+`transaction_id`, then reads XOR-MAPPED-ADDRESS (attribute `0x0020`), falling back to
+MAPPED-ADDRESS (`0x0001`). For XOR-MAPPED-ADDRESS the port is `x_port XOR (magic >> 16)`
+and an IPv4 address is `x_addr XOR magic` (IPv6 XORs `magic || transaction_id`). STUN
+only reflects the socket's public address; it sees no application content.
+
+### Punch datagrams
+
+The gathered candidates go to the peer over signaling. Both sides then send
+authenticated datagrams to each other's candidates on the same UDP socket and listen.
+Datagrams are self-delimiting, so there is no length prefix - a one-byte type leads:
+
+    0x11 PROBE      session_nonce(16) | probe_nonce(16) | tag(32)
+    0x12 PONG       session_nonce(16) | probe_nonce(16) | tag(32)
+    0x13 KEEPALIVE  session_nonce(16)
+
+    PROBE.tag = HMAC(K, "ponydirect/wan-probe/v1" || session_nonce || probe_nonce)
+    PONG.tag  = HMAC(K, "ponydirect/wan-pong/v1"  || session_nonce || probe_nonce)
+
+A PONG echoes the PROBE's `probe_nonce` so the prober can match it. A path is
+established once a peer answers a PROBE with a valid PONG, or once a valid PROBE is
+received (which proves the peer can reach this socket); the datagram's source address
+becomes the active remote. The first candidate that yields a verified packet wins.
+KEEPALIVE (unauthenticated NAT-hold traffic) is sent on the active path every ~15 s.
+
+Only the real peer can produce a valid PROBE or PONG, so an off-path or spoofed
+sender cannot hijack the path; `session_nonce` binds the exchange so a captured probe
+cannot be replayed into a new session. Symmetric NAT on both ends will not punch; the
+host app falls back to its own store-and-forward path (no TURN).
 
 ## Delivery
 
