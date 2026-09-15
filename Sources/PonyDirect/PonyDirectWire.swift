@@ -4,6 +4,7 @@
 
 import Foundation
 import CryptoKit
+import Security
 
 /// The byte-level protocol: framing, the per-peer authenticated tags used by the
 /// identify handshake (LAN) and the hole-punch probes (WAN), and constant-time
