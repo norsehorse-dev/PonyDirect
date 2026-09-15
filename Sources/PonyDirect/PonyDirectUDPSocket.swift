@@ -53,7 +53,14 @@ public final class PonyDirectUDPSocket {
                 bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        guard bindOK == 0 else { close(fd); throw PonyDirectSocketError.bind(errno) }
+        guard bindOK == 0 else {
+            #if canImport(Darwin)
+            Darwin.close(fd)
+            #else
+            Glibc.close(fd)
+            #endif
+            throw PonyDirectSocketError.bind(errno)
+        }
 
         // Read back the assigned port.
         var bound = sockaddr_in()
