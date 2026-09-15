@@ -28,6 +28,8 @@ public enum PonyDirectWire {
     private static let labelIdentifyAck = Data("ponydirect/id-ack/v1".utf8)
     private static let labelProbe = Data("ponydirect/wan-probe/v1".utf8)
     private static let labelPong = Data("ponydirect/wan-pong/v1".utf8)
+    private static let labelData = Data("ponydirect/wan-data/v1".utf8)
+    private static let labelAck = Data("ponydirect/wan-ack/v1".utf8)
 
     public static func randomBytes(_ count: Int) -> Data {
         var bytes = [UInt8](repeating: 0, count: count)
@@ -53,6 +55,15 @@ public enum PonyDirectWire {
     }
     public static func pongTag(pairKey: Data, sessionNonce: Data, probeNonce: Data) -> Data {
         hmac(key: pairKey, labelPong + sessionNonce + probeNonce)
+    }
+
+    // WAN reliable-datagram (ARQ) authentication. `header` is the fixed fields, the
+    // chunk `payload` is appended, so the tag covers the whole datagram.
+    public static func dataTag(pairKey: Data, header: Data, payload: Data) -> Data {
+        hmac(key: pairKey, labelData + header + payload)
+    }
+    public static func ackTag(pairKey: Data, header: Data, bitmap: Data) -> Data {
+        hmac(key: pairKey, labelAck + header + bitmap)
     }
 
     /// Length-prefixed frame: `type(1) | length(4, big-endian) | payload`.

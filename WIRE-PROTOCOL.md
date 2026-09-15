@@ -91,7 +91,28 @@ host app falls back to its own store-and-forward path (no TURN).
 
 ## Delivery
 
-Application payloads move as `0x04 ENVELOPE` frames over whichever path is up
-(LAN TCP stream, or the hole-punched UDP path with a small reliability layer for
-chunking large payloads). The payload is opaque and already end-to-end secured by
-the app; PonyDirect adds transport, not confidentiality.
+On the LAN TCP stream a payload is a single `0x04 ENVELOPE` frame. On the
+hole-punched UDP path a payload is split into authenticated chunks with a small
+ACK/retransmit layer, since UDP has no ordering or reliability of its own:
+
+    0x14 DATA  session_nonce(16) | msg_seq(4) | chunk_index(2) | chunk_count(2) | payload | tag(32)
+    0x15 ACK   session_nonce(16) | msg_seq(4) | chunk_count(2) | bitmap | tag(32)
+
+    DATA.tag = HMAC(K, "ponydirect/wan-data/v1" || session_nonce || msg_seq ||
+                       chunk_index || chunk_count || payload)
+    ACK.tag  = HMAC(K, "ponydirect/wan-ack/v1"  || session_nonce || msg_seq ||
+                       chunk_count || bitmap)
+
+All integers are big-endian. Each chunk carries at most 1024 payload bytes, so a
+DATA datagram stays well under a safe path MTU. `msg_seq` is chosen by the sender
+and identifies one message; `bitmap` has `ceil(chunk_count/8)` bytes, bit `i` set
+meaning chunk `i` was received. The sender transmits every chunk, the receiver ACKs
+the bitmap of what it holds, and the sender retransmits only the gaps on a timer
+until every chunk is acked or a deadline passes (after which the app's relay path
+covers it). The receiver reassembles chunks `0..chunk_count-1` in order and hands
+the bytes to the app; it remembers recently completed `msg_seq`s so a retransmit
+after its ACK was lost is re-acked, not re-delivered. Every DATA and ACK is tagged
+with the per-pair key, so only the real peer can inject or acknowledge chunks. A
+per-message size cap (256 chunks, 256 KB) bounds reassembly; larger payloads are
+left to the relay. The reassembled bytes are opaque and already end-to-end secured
+by the app; PonyDirect adds transport, not confidentiality.
