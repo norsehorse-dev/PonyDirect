@@ -81,7 +81,12 @@ public final class PonyDirectUDPSocket {
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = port.bigEndian
-        guard inet_pton(AF_INET, host, &addr.sin_addr) == 1 else { return }
+        // Numeric IPv4 literal (punch candidates) takes the fast path; a hostname
+        // (e.g. the STUN server) is resolved, since inet_pton does not do DNS.
+        if inet_pton(AF_INET, host, &addr.sin_addr) != 1 {
+            guard let resolved = PonyDirectUDPSocket.resolveIPv4(host) else { return }
+            addr.sin_addr = resolved
+        }
         let n = data.count
         data.withUnsafeBytes { raw in
             _ = withUnsafePointer(to: &addr) {
@@ -152,6 +157,21 @@ public final class PonyDirectUDPSocket {
             ptr = cur.pointee.ifa_next
         }
         return result
+    }
+
+    /// Resolve a hostname to its first IPv4 address (for the STUN server host).
+    static func resolveIPv4(_ host: String) -> in_addr? {
+        var hints = addrinfo()
+        hints.ai_family = AF_INET
+        hints.ai_socktype = SOCK_DGRAM
+        var res: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &res) == 0, let first = res else { return nil }
+        defer { freeaddrinfo(res) }
+        var out: in_addr?
+        if let sa = first.pointee.ai_addr {
+            sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { out = $0.pointee.sin_addr }
+        }
+        return out
     }
 }
 
