@@ -50,10 +50,12 @@ public final class PonyDirectWan {
         let chunks: [Data]
         var ackedBitmap: Data
         var roundsLeft: Int
-        init(peerID: String, sessionNonce: Data, chunks: [Data], rounds: Int) {
+        var onComplete: ((Bool) -> Void)?
+        init(peerID: String, sessionNonce: Data, chunks: [Data], rounds: Int, onComplete: ((Bool) -> Void)?) {
             self.peerID = peerID; self.sessionNonce = sessionNonce; self.chunks = chunks
             self.ackedBitmap = Data(repeating: 0, count: PonyDirectArq.bitmapLen(chunkCount: chunks.count))
             self.roundsLeft = rounds
+            self.onComplete = onComplete
         }
     }
 
@@ -393,8 +395,12 @@ public final class PonyDirectWan {
     /// Queue a payload for reliable delivery over the connected direct path. Returns
     /// false (so the caller uses the relay) if there is no live path or the payload
     /// exceeds the direct-path size cap.
+    /// Queue a payload for reliable delivery. Returns false immediately (use the
+    /// relay) if there is no live path or the payload exceeds the size cap. When it
+    /// returns true, `onComplete` fires later with true once every chunk is acked, or
+    /// false if the deadline passes first.
     @discardableResult
-    public func sendPayload(_ payload: Data, toPeer peerID: String) -> Bool {
+    public func sendPayload(_ payload: Data, toPeer peerID: String, onComplete: ((Bool) -> Void)? = nil) -> Bool {
         var ok = false
         queue.sync {
             guard let s = sessions[peerID], s.state == .connected, let remote = s.activeRemote,
@@ -402,7 +408,7 @@ public final class PonyDirectWan {
             let chunks = PonyDirectArq.chunk(payload)
             guard chunks.count <= maxChunks else { return }
             let seq = nextMsgSeq; nextMsgSeq = nextMsgSeq &+ 1
-            let msg = OutgoingMsg(peerID: peerID, sessionNonce: s.sessionNonce, chunks: chunks, rounds: arqRounds)
+            let msg = OutgoingMsg(peerID: peerID, sessionNonce: s.sessionNonce, chunks: chunks, rounds: arqRounds, onComplete: onComplete)
             outgoing[seq] = msg
             sendUnacked(seq: seq, msg: msg, pairKey: pairKey, remote: remote)
             ensureArqTimer()
@@ -432,9 +438,11 @@ public final class PonyDirectWan {
     private func arqTick() {
         for (seq, msg) in outgoing {
             guard let s = sessions[msg.peerID], s.state == .connected, let remote = s.activeRemote,
-                  let pairKey = keys.pairKey(forPeer: msg.peerID) else { outgoing[seq] = nil; continue }
+                  let pairKey = keys.pairKey(forPeer: msg.peerID) else {
+                outgoing[seq] = nil; msg.onComplete?(false); continue
+            }
             msg.roundsLeft -= 1
-            if msg.roundsLeft <= 0 { outgoing[seq] = nil; continue }
+            if msg.roundsLeft <= 0 { outgoing[seq] = nil; msg.onComplete?(false); continue }
             sendUnacked(seq: seq, msg: msg, pairKey: pairKey, remote: remote)
         }
         if outgoing.isEmpty { arqTimer?.cancel(); arqTimer = nil }
@@ -493,7 +501,7 @@ public final class PonyDirectWan {
         }
         var allAcked = true
         for i in 0..<count where !PonyDirectArq.bitmapGet(msg.ackedBitmap, i) { allAcked = false; break }
-        if allAcked { outgoing[ap.msgSeq] = nil }
+        if allAcked { outgoing[ap.msgSeq] = nil; msg.onComplete?(true) }
     }
 
     public func state(ofPeer peerID: String) -> PathState {
