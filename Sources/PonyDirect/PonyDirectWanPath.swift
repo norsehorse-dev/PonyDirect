@@ -38,6 +38,7 @@ public final class PonyDirectWan {
         var activeRemote: PonyDirectUDPSocket.Source?
         var state: PathState = .idle
         var probeRounds = 0
+        var offerRounds = 0
         init(peerID: String, role: Role, sessionNonce: Data) {
             self.peerID = peerID; self.role = role; self.sessionNonce = sessionNonce
         }
@@ -55,12 +56,15 @@ public final class PonyDirectWan {
     private var reflexive: String?                        // "ip:port"
     private var hostCandidates: [String] = []
     private var probeTimer: DispatchSourceTimer?
+    private var offerTimer: DispatchSourceTimer?
     private var keepaliveTimer: DispatchSourceTimer?
 
     // Tunables.
     private let probeIntervalMs = 250
     private let maxProbeRounds = 40          // ~10s of punching before giving up
     private let keepaliveIntervalMs = 15_000
+    private let offerIntervalMs = 2000       // re-send the offer until answered
+    private let maxOfferRounds = 15          // fast-retry burst (~30s), then slow back-off
 
     public init(stun: StunServer, keys: PonyDirectKeyProvider, signaling: PonyDirectSignaling) throws {
         self.socket = try PonyDirectUDPSocket()
@@ -85,10 +89,11 @@ public final class PonyDirectWan {
             self.setState(session, .gathering)
             self.gatherCandidates()
             if role == .initiator {
-                // Offer goes out once candidates are gathered (gatherCandidates
-                // sends it when reflexive resolves or times out).
+                // Send the offer now, then re-send it on a timer until an answer
+                // arrives, so the order the two sides enable WAN does not matter.
                 self.pendingOfferPeers.insert(peerID)
                 self.sendOfferIfReady(session)
+                self.ensureOfferTimer()
             }
         }
     }
@@ -200,6 +205,30 @@ public final class PonyDirectWan {
         ensureProbeTimer()
     }
 
+    private func ensureOfferTimer() {
+        guard offerTimer == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + .milliseconds(offerIntervalMs), repeating: .milliseconds(offerIntervalMs))
+        t.setEventHandler { [weak self] in self?.offerTick() }
+        offerTimer = t
+        t.resume()
+    }
+
+    private func offerTick() {
+        var anyWaiting = false
+        for session in sessions.values where session.role == .initiator && session.state == .gathering {
+            anyWaiting = true
+            session.offerRounds += 1
+            // Re-send every tick for the first burst (~30s), then back off to about
+            // every 16s and keep trying as long as WAN is on and no answer has come,
+            // so the peer can enable WAN at any later time and still connect.
+            if session.offerRounds <= maxOfferRounds || session.offerRounds % 8 == 0 {
+                sendOfferIfReady(session)
+            }
+        }
+        if !anyWaiting { offerTimer?.cancel(); offerTimer = nil }
+    }
+
     private func ensureProbeTimer() {
         guard probeTimer == nil else { return }
         let t = DispatchSource.makeTimerSource(queue: queue)
@@ -301,6 +330,7 @@ public final class PonyDirectWan {
 
     private func stopTimers() {
         stopProbeTimer()
+        offerTimer?.cancel(); offerTimer = nil
         keepaliveTimer?.cancel(); keepaliveTimer = nil
     }
 
