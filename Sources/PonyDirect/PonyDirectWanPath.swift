@@ -118,7 +118,15 @@ public final class PonyDirectWan {
     public func open(peer peerID: String, as role: Role) {
         queue.async { [weak self] in
             guard let self = self else { return }
-            if self.sessions[peerID] != nil { return }
+            if let existing = self.sessions[peerID] {
+                // Already tracking this peer; if it is a not-yet-connected initiator,
+                // make sure it is still offering (recover a stalled session without a
+                // manual re-toggle).
+                if existing.role == .initiator && existing.state != .connected {
+                    self.ensureOfferTimer()
+                }
+                return
+            }
             let nonce = role == .initiator ? PonyDirectWire.randomBytes(16) : Data()
             let session = Session(peerID: peerID, role: role, sessionNonce: nonce)
             self.sessions[peerID] = session
@@ -281,7 +289,13 @@ public final class PonyDirectWan {
             guard let pairKey = keys.pairKey(forPeer: session.peerID) else { continue }
             session.probeRounds += 1
             if session.probeRounds > maxProbeRounds {
-                setState(session, .failed)
+                // Punch attempt exhausted. Fall back to re-offering (fresh candidates)
+                // rather than a terminal failure, so it keeps trying while WAN is on
+                // and reconnects on its own after a network change, no re-toggle.
+                session.probeRounds = 0
+                session.remoteCandidates = []
+                setState(session, .gathering)
+                ensureOfferTimer()
                 continue
             }
             for cand in session.remoteCandidates {
