@@ -1,0 +1,9 @@
+PonyDirect
+Copyright 2026 NorseHorse
+
+Licensed under the Apache License, Version 2.0.
+
+A small, dependency-free peer-to-peer transport for already-paired peers:
+sealed-envelope delivery over the local network (mDNS) and directly over the
+internet (STUN + UDP hole punching), with an authenticated identify handshake.
+It carries opaque bytes; the application owns the encryption and the key exchange.
