@@ -116,3 +116,40 @@ with the per-pair key, so only the real peer can inject or acknowledge chunks. A
 per-message size cap (256 chunks, 256 KB) bounds reassembly; larger payloads are
 left to the relay. The reassembled bytes are opaque and already end-to-end secured
 by the app; PonyDirect adds transport, not confidentiality.
+## Reliable stream (bulk transfer)
+
+The message ARQ above carries one bounded message (256 KB cap) and is what CarrierPony uses. Bulk
+transfer (files) needs an ordered byte stream instead, so the stream frames below turn the punched
+UDP path into a reliable, full-duplex byte stream with its own flow and congestion control. The
+message ARQ (`0x14`/`0x15`) and the stream (`0x16`-`0x19`) coexist; a receiver dispatches on the
+type byte. Sequence numbers are **byte offsets** (8 bytes), so a stream carries gigabytes without
+wrapping and a resumed transfer names an exact offset. All integers big-endian; every frame is
+HMAC-SHA256 tagged with the per-pair key `K`.
+
+    0x16 SDATA  session_nonce(16) | seq(8) | len(2) | payload | tag(32)
+    0x17 SACK   session_nonce(16) | cum_ack(8) | rwnd(4) | nblk(1) | nblk*[start(8) end(8)] | tag(32)
+    0x18 SFIN   session_nonce(16) | final_seq(8) | tag(32)
+    0x19 SRST   session_nonce(16) | tag(32)
+
+    SDATA.tag = HMAC(K, "ponydirect/stream-data/v1" || session_nonce || seq || len || payload)
+    SACK.tag  = HMAC(K, "ponydirect/stream-ack/v1"  || session_nonce || cum_ack || rwnd || nblk || blocks)
+    SFIN.tag  = HMAC(K, "ponydirect/stream-fin/v1"  || session_nonce || final_seq)
+    SRST.tag  = HMAC(K, "ponydirect/stream-rst/v1"  || session_nonce)
+
+`seq` is the byte offset of the first payload byte in the stream. Each SDATA carries at most 1024
+payload bytes, the same safe-MTU discipline as the message ARQ. `cum_ack` is the next in-order byte
+offset the receiver still needs; every offset below it has been delivered in order. `blocks` are
+received-but-not-contiguous ranges `[start, end)` (at most 16 per SACK) so the sender retransmits
+only real gaps, not everything after a loss. `rwnd` is the receiver's free buffer in bytes, the
+flow-control window: the sender never sends past `cum_ack + rwnd`. SFIN closes one direction's send
+half at `final_seq` (each side FINs independently); SRST aborts. Only the real peer can produce a
+valid tag, so no off-path sender can inject or acknowledge stream bytes, and `session_nonce` binds
+the exchange against replay into a new session.
+
+The frames above are the byte contract. The engine that drives them lives above this codec and is
+built in layers: a sliding-window ARQ (cumulative + selective ACK, RFC 6298 RTO, fast retransmit),
+receiver flow control off `rwnd`, and congestion control (AIMD with slow start and packet pacing
+first, a delay-based controller such as LEDBAT later), exposed to the app as an ordered byte stream.
+Unlike the message ARQ there is no relay fallback for the host app to lean on: a stream that stalls
+past its deadline fails, and the app surfaces that rather than pretending. Symmetric NAT on both
+ends still will not punch, so a stream only exists once a path is connected.

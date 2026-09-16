@@ -30,6 +30,10 @@ public enum PonyDirectWire {
     private static let labelPong = Data("ponydirect/wan-pong/v1".utf8)
     private static let labelData = Data("ponydirect/wan-data/v1".utf8)
     private static let labelAck = Data("ponydirect/wan-ack/v1".utf8)
+    private static let labelStreamData = Data("ponydirect/stream-data/v1".utf8)
+    private static let labelStreamAck = Data("ponydirect/stream-ack/v1".utf8)
+    private static let labelStreamFin = Data("ponydirect/stream-fin/v1".utf8)
+    private static let labelStreamRst = Data("ponydirect/stream-rst/v1".utf8)
 
     public static func randomBytes(_ count: Int) -> Data {
         var bytes = [UInt8](repeating: 0, count: count)
@@ -64,6 +68,20 @@ public enum PonyDirectWire {
     }
     public static func ackTag(pairKey: Data, header: Data, bitmap: Data) -> Data {
         hmac(key: pairKey, labelAck + header + bitmap)
+    }
+
+    // WAN reliable-stream (bulk) authentication.
+    public static func streamDataTag(pairKey: Data, header: Data, payload: Data) -> Data {
+        hmac(key: pairKey, labelStreamData + header + payload)
+    }
+    public static func streamAckTag(pairKey: Data, header: Data, blocks: Data) -> Data {
+        hmac(key: pairKey, labelStreamAck + header + blocks)
+    }
+    public static func streamFinTag(pairKey: Data, header: Data) -> Data {
+        hmac(key: pairKey, labelStreamFin + header)
+    }
+    public static func streamRstTag(pairKey: Data, sessionNonce: Data) -> Data {
+        hmac(key: pairKey, labelStreamRst + sessionNonce)
     }
 
     /// Length-prefixed frame: `type(1) | length(4, big-endian) | payload`.
