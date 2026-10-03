@@ -1,6 +1,10 @@
 // PonyDirectStreamSender.swift
 // Sender half of the stream ARQ, with congestion control. Chunk-aligned windowed send over the
-// outgoing byte buffer:
+// outgoing bytes, which are held only until acknowledged: write() appends whole chunks to a queue
+// and chunks below the cumulative ACK are dropped, so memory is bounded by what is in flight plus
+// what the caller has queued (bufferedBytes), not by the size of the stream. A caller streaming a
+// large file waits for bufferedBytes to fall before writing more.
+//
 //   - RFC 6298 RTO retransmit (Karn's algorithm: no RTT sample on retransmits).
 //   - Congestion window: slow start (exponential) up to ssthresh, then AIMD congestion avoidance
 //     (about one MSS per RTT). A timeout halves ssthresh and restarts slow start at one MSS.
@@ -25,7 +29,14 @@ public final class PonyDirectStreamSender {
     private let minRtoMs: Int64
     private let maxRtoMs: Int64
 
-    private var data = Data()
+    // Chunks from index firstChunk onward that are not yet below the cumulative ACK (chunks[head...]),
+    // plus the partial chunk still being filled. Everything before firstChunk was acked and dropped.
+    private var chunks: [Data] = []
+    private var head = 0
+    private var firstChunk: Int64 = 0
+    private var tail = Data()
+    private var written: Int64 = 0
+    private var held: Int64 = 0
     private var finished = false
 
     private var baseChunk: Int64 = 0
@@ -63,19 +74,46 @@ public final class PonyDirectStreamSender {
         self.pacingTokens = Double(initialCwndBytes)
     }
 
-    public func write(_ bytes: Data) { precondition(!finished, "already finished"); data.append(bytes) }
-    public func finish() { finished = true }
+    /// Bytes written but not yet acknowledged (in flight, queued, or in the partial last chunk).
+    public var bufferedBytes: Int64 { held }
 
-    private func chunksReady() -> Int64 {
-        let n = Int64(data.count)
-        return finished ? (n + chunk - 1) / chunk : n / chunk
+    public func write(_ bytes: Data) {
+        guard !finished, !bytes.isEmpty else { return }
+        let size = Int(chunk)
+        var idx = bytes.startIndex
+        while idx < bytes.endIndex {
+            let take = Swift.min(size - tail.count, bytes.endIndex - idx)
+            tail.append(bytes[idx..<(idx + take)])
+            idx += take
+            if tail.count == size { chunks.append(tail); tail = Data() }
+        }
+        written += Int64(bytes.count)
+        held += Int64(bytes.count)
     }
-    private func chunkBytes(_ i: Int64) -> Data {
-        let start = Int(i * chunk)
-        let end = Swift.min(start + Int(chunk), data.count)
-        return data.subdata(in: start..<end)
+
+    public func finish() {
+        guard !finished else { return }
+        if !tail.isEmpty { chunks.append(tail); tail = Data() }
+        finished = true
     }
-    private func totalBytes() -> Int64 { Int64(data.count) }
+
+    private func chunksReady() -> Int64 { firstChunk + Int64(chunks.count - head) }
+    private func chunkBytes(_ i: Int64) -> Data { chunks[head + Int(i - firstChunk)] }
+    private func totalBytes() -> Int64 { written }
+
+    /// Release chunks that are now below the cumulative ACK.
+    private func dropAcked() {
+        while firstChunk < baseChunk && head < chunks.count {
+            held -= Int64(chunks[head].count)
+            chunks[head] = Data()
+            head += 1
+            firstChunk += 1
+        }
+        if head >= 1024 && head * 2 >= chunks.count {      // compact now and then, not per ACK
+            chunks.removeFirst(head)
+            head = 0
+        }
+    }
 
     public func isDone() -> Bool { finished && baseChunk >= chunksReady() }
 
@@ -128,6 +166,7 @@ public final class PonyDirectStreamSender {
             }
         }
         while acked.contains(baseChunk) { acked.remove(baseChunk); baseChunk += 1 }
+        dropAcked()
         if newlyAcked > 0 { grow(newlyAcked) }
     }
 

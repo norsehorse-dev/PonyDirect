@@ -14,6 +14,18 @@ public protocol PonyDirectWanDelegate: AnyObject {
     /// A verified application datagram arrived on the path. (M3 feeds this to the
     /// envelope sink; in M2 no envelope datagrams are sent.)
     func wan(_ wan: PonyDirectWan, peer peerID: String, didReceivePayload payload: Data)
+    /// Bytes delivered in order over a reliable stream (bulk transfer). Default: ignored.
+    func wan(_ wan: PonyDirectWan, peer peerID: String, didReceiveStreamBytes bytes: Data)
+    /// The inbound stream from this peer finished (all bytes delivered). Default: ignored.
+    func wanStreamReceiveDidComplete(_ wan: PonyDirectWan, peer peerID: String)
+    /// The outbound stream to this peer finished (true) or gave up (false). Default: ignored.
+    func wanStreamSendDidComplete(_ wan: PonyDirectWan, peer peerID: String, success: Bool)
+}
+
+public extension PonyDirectWanDelegate {
+    func wan(_ wan: PonyDirectWan, peer peerID: String, didReceiveStreamBytes bytes: Data) {}
+    func wanStreamReceiveDidComplete(_ wan: PonyDirectWan, peer peerID: String) {}
+    func wanStreamSendDidComplete(_ wan: PonyDirectWan, peer peerID: String, success: Bool) {}
 }
 
 /// Manages authenticated UDP paths to peers over one bound socket.
@@ -90,6 +102,22 @@ public final class PonyDirectWan {
     private var outgoing: [UInt32: OutgoingMsg] = [:]
     private var incoming: [String: Reassembly] = [:]
     private var completed: [String] = []
+    private var streamEngines: [String: PonyDirectStreamEngine] = [:]
+    private var streamRecvDone = Set<String>()
+    private var streamSendDone = Set<String>()
+    private var streamTimer: DispatchSourceTimer?
+    private let streamIntervalMs = 20
+    // Outbound backpressure, readable from any thread: bytes handed to writeStream but not yet in the
+    // engine, and the engine's unacknowledged bytes as of the last write or tick.
+    private let backpressureLock = NSLock()
+    private var streamQueued: [String: Int64] = [:]
+    private var streamHeld: [String: Int64] = [:]
+    private func adjustQueued(_ peerID: String, by delta: Int64) {
+        backpressureLock.lock(); streamQueued[peerID, default: 0] += delta; backpressureLock.unlock()
+    }
+    private func setHeld(_ peerID: String, _ value: Int64?) {
+        backpressureLock.lock(); streamHeld[peerID] = value; backpressureLock.unlock()
+    }
 
     // Tunables.
     private let probeIntervalMs = 250
@@ -148,6 +176,13 @@ public final class PonyDirectWan {
             guard let self = self, let s = self.sessions[peerID] else { return }
             self.setState(s, .idle)
             self.sessions.removeValue(forKey: peerID)
+            self.streamEngines.removeValue(forKey: peerID)
+            self.streamRecvDone.remove(peerID)
+            self.streamSendDone.remove(peerID)
+            self.backpressureLock.lock()
+            self.streamQueued.removeValue(forKey: peerID)
+            self.streamHeld.removeValue(forKey: peerID)
+            self.backpressureLock.unlock()
             if self.sessions.isEmpty { self.stopTimers() }
         }
     }
@@ -180,6 +215,20 @@ public final class PonyDirectWan {
                 session.remoteCandidates = self.merge(session.remoteCandidates, [c])
                 self.startPunching(session)
             }
+        }
+    }
+
+    /// A human-readable snapshot for on-device debugging. No secrets: candidates are ip:port only.
+    public func diagnostics() -> String {
+        queue.sync {
+            var lines: [String] = []
+            lines.append("STUN reflexive: " + (reflexive ?? "NONE (no public addr)"))
+            lines.append("host candidates: \(hostCandidates.count)")
+            if sessions.isEmpty { lines.append("(no sessions yet)") }
+            for (pid, s) in sessions {
+                lines.append("peer \(String(pid.prefix(10)))… state=\(s.state.rawValue) remoteCands=\(s.remoteCandidates.count) probe=\(s.probeRounds)/\(maxProbeRounds)")
+            }
+            return lines.joined(separator: "\n")
         }
     }
 
@@ -343,6 +392,17 @@ public final class PonyDirectWan {
             handleAck(ap, session: session)
             return
         }
+        // Reliable-stream (bulk) frames: route to the peer's stream engine by session nonce.
+        if let first = data.first,
+           first == PonyDirectStream.Packet.data.rawValue || first == PonyDirectStream.Packet.ack.rawValue ||
+           first == PonyDirectStream.Packet.fin.rawValue || first == PonyDirectStream.Packet.rst.rawValue {
+            guard data.count >= 17 else { return }
+            let nonce = data.subdata(in: 1..<17)
+            guard let session = sessions.values.first(where: { PonyDirectWire.constantTimeEquals($0.sessionNonce, nonce) }),
+                  let e = streamEngine(for: session) else { return }
+            e.onWireDatagram(nowMs(), data)
+            return
+        }
         // Punch packet?
         guard let parsed = PonyDirectPunch.parse(data) else { return }
         guard let session = sessions.values.first(where: {
@@ -400,6 +460,7 @@ public final class PonyDirectWan {
         offerTimer?.cancel(); offerTimer = nil
         keepaliveTimer?.cancel(); keepaliveTimer = nil
         arqTimer?.cancel(); arqTimer = nil
+        streamTimer?.cancel(); streamTimer = nil
     }
 
     // MARK: - Helpers
@@ -518,7 +579,101 @@ public final class PonyDirectWan {
         if allAcked { outgoing[ap.msgSeq] = nil; msg.onComplete?(true) }
     }
 
-    public func state(ofPeer peerID: String) -> PathState {
+    // MARK: - Reliable stream (bulk transfer)
+
+    /// Open (or reuse) a reliable byte-stream to a connected peer.
+    public func openStream(toPeer peerID: String) {
+        queue.async { [weak self] in
+            guard let self = self, let s = self.sessions[peerID] else { return }
+            _ = self.streamEngine(for: s)
+        }
+    }
+
+    /// Append bytes to the outbound stream to a peer. Returns at once; the bytes are held until the
+    /// peer acknowledges them. A caller streaming more than fits in memory should wait while
+    /// streamSendBufferedBytes(toPeer:) is above its own high-water mark before writing more.
+    public func writeStream(_ bytes: Data, toPeer peerID: String) {
+        let n = Int64(bytes.count)
+        adjustQueued(peerID, by: n)
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            self.adjustQueued(peerID, by: -n)
+            guard let s = self.sessions[peerID], let e = self.streamEngine(for: s) else { return }
+            e.write(bytes)
+            self.setHeld(peerID, e.sendBufferedBytes())
+        }
+    }
+
+    /// Outbound bytes to a peer not yet acknowledged, including ones still queued for the stream
+    /// queue. Safe from any thread. Falls as the peer acknowledges; stays flat if the peer stalls.
+    public func streamSendBufferedBytes(toPeer peerID: String) -> Int64 {
+        backpressureLock.lock(); defer { backpressureLock.unlock() }
+        return (streamQueued[peerID] ?? 0) + (streamHeld[peerID] ?? 0)
+    }
+
+    /// Signal end-of-stream for the outbound stream to a peer.
+    public func finishStream(toPeer peerID: String) {
+        queue.async { [weak self] in
+            guard let self = self, let s = self.sessions[peerID], let e = self.streamEngine(for: s) else { return }
+            e.finishSending()
+        }
+    }
+
+    private func streamEngine(for session: Session) -> PonyDirectStreamEngine? {
+        if let e = streamEngines[session.peerID] { return e }
+        guard let pairKey = keys.pairKey(forPeer: session.peerID) else { return nil }
+        let peerID = session.peerID
+        let e = PonyDirectStreamEngine(pairKey: pairKey, sessionNonce: session.sessionNonce, onDatagram: { [weak self] frame in
+            guard let self = self, let s = self.sessions[peerID], let remote = s.activeRemote else { return }
+            self.socket.send(frame, toHost: remote.host, port: remote.port)
+        })
+        streamEngines[peerID] = e
+        ensureStreamTimer()
+        return e
+    }
+
+    private func ensureStreamTimer() {
+        guard streamTimer == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now(), repeating: .milliseconds(streamIntervalMs))
+        t.setEventHandler { [weak self] in self?.streamTick() }
+        streamTimer = t
+        t.resume()
+    }
+
+    private func streamTick() {
+        let now = nowMs()
+        for (peerID, e) in streamEngines {
+            e.tick(now)
+            setHeld(peerID, e.sendBufferedBytes())
+            let bytes = e.read(1 << 20)
+            if !bytes.isEmpty {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.delegate?.wan(self, peer: peerID, didReceiveStreamBytes: bytes)
+                }
+            }
+            if e.recvComplete() && !streamRecvDone.contains(peerID) {
+                streamRecvDone.insert(peerID)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.delegate?.wanStreamReceiveDidComplete(self, peer: peerID)
+                }
+            }
+            if e.sendComplete() && !streamSendDone.contains(peerID) {
+                streamSendDone.insert(peerID)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.delegate?.wanStreamSendDidComplete(self, peer: peerID, success: true)
+                }
+            }
+        }
+        if streamEngines.isEmpty { streamTimer?.cancel(); streamTimer = nil }
+    }
+
+    private func nowMs() -> Int64 { Int64(DispatchTime.now().uptimeNanoseconds / 1_000_000) }
+
+        public func state(ofPeer peerID: String) -> PathState {
         queue.sync { sessions[peerID]?.state ?? .idle }
     }
 
